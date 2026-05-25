@@ -1,0 +1,19 @@
+{
+  "name": "dummy-azure-app",
+  "version": "1.0.0",
+  "description": "Dummy Node.js app for GitHub Actions + Azure VM self-hosted runner demo",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "node src/app.js",
+    "dev": "nodemon src/app.js",
+    "test": "jest --forceExit --coverage"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "nodemon": "^3.0.2",
+    "supertest": "^6.3.4"
+  }
+}
