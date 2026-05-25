@@ -3,23 +3,22 @@ name: Deploy to Azure VM (Self-Hosted Runner)
 on:
   push:
     branches:
-      - main          # Auto-deploy on merge to main
-  workflow_dispatch:  # Allow manual trigger from GitHub UI
+      - main
+  workflow_dispatch:
 
-# Prevent multiple deployments running at the same time
 concurrency:
   group: production-deploy
-  cancel-in-progress: false   # Wait for in-progress deploy, don't cancel it
+  cancel-in-progress: false
 
 env:
-  APP_DIR: /var/www/dummy-app  # Directory on your Azure VM where app lives
+  APP_DIR: /var/www/dummy-app
   NODE_ENV: production
 
 jobs:
-  # ── Job 1: Run tests on GitHub-hosted runner (fast, cheap) ─────────────────
+  # ── Job 1: Run tests on GitHub-hosted runner ───────────────────────────────
   test:
     name: Run Tests
-    runs-on: ubuntu-latest   # GitHub-hosted is fine for tests
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
@@ -29,10 +28,11 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: "npm"
+          # FIX 1: removed cache: "npm" — requires package-lock.json to exist
+          # if you have package-lock.json committed, you can re-add it
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install   # FIX 2: use npm install instead of npm ci (installs ALL deps including jest)
 
       - name: Run tests
         run: npm test
@@ -45,18 +45,28 @@ jobs:
           path: coverage/
           retention-days: 7
 
-  # ── Job 2: Deploy on self-hosted runner (has access to Azure VM directly) ──
+  # ── Job 2: Deploy on self-hosted runner ────────────────────────────────────
   deploy:
     name: Deploy to Azure VM
-    runs-on: [self-hosted, azure, prod]   # Targets your self-hosted runner by labels
-    needs: test                           # Only runs if tests pass
-    environment: production               # Requires manual approval if configured in GitHub
+    runs-on: [self-hosted, linux]   # FIX 3: use labels that match your actual runner
+    needs: test
+    environment: production
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ── Pull latest code into app directory ──────────────────────────────
+      # ── Ensure app directory exists and is a git repo ─────────────────────
+      - name: Setup app directory
+        run: |
+          if [ ! -d "${{ env.APP_DIR }}" ]; then
+            echo "📁 Creating app directory..."
+            sudo mkdir -p ${{ env.APP_DIR }}
+            sudo chown $USER:$USER ${{ env.APP_DIR }}
+            git clone ${{ github.server_url }}/${{ github.repository }}.git ${{ env.APP_DIR }}
+          fi
+
+      # ── Pull latest code ──────────────────────────────────────────────────
       - name: Pull latest code
         run: |
           cd ${{ env.APP_DIR }}
@@ -68,24 +78,34 @@ jobs:
       - name: Install production dependencies
         run: |
           cd ${{ env.APP_DIR }}
-          npm ci --omit=dev
+          npm install --omit=dev   # FIX 4: npm install instead of npm ci (no lockfile needed)
           echo "✅ Dependencies installed"
 
-      # ── Set the app version from git commit sha ───────────────────────────
-      - name: Set app version
+      # ── Write .env file ───────────────────────────────────────────────────
+      - name: Write .env file
         run: |
           cd ${{ env.APP_DIR }}
-          echo "APP_VERSION=${{ github.sha }}" | cut -c1-7 >> .env
-          echo "NODE_ENV=production" >> .env
-          echo "PORT=3000" >> .env
+          # FIX 5: corrected the APP_VERSION — previous version had a bug with pipe + redirect
+          cat > .env << ENVEOF
+          APP_VERSION=$(echo "${{ github.sha }}" | cut -c1-7)
+          NODE_ENV=production
+          PORT=3000
+          ENVEOF
+          echo "✅ .env written"
 
-      # ── Restart the app via PM2 (zero-downtime reload) ────────────────────
+      # ── Check PM2 is installed ────────────────────────────────────────────
+      - name: Ensure PM2 is installed
+        run: |
+          if ! command -v pm2 &> /dev/null; then
+            echo "📦 Installing PM2..."
+            npm install -g pm2
+          fi
+          pm2 --version
+
+      # ── Restart app via PM2 ───────────────────────────────────────────────
       - name: Restart app with PM2
         run: |
           cd ${{ env.APP_DIR }}
-
-          # If app is already registered with PM2, reload it (zero downtime)
-          # Otherwise start it fresh
           if pm2 describe dummy-app > /dev/null 2>&1; then
             pm2 reload dummy-app --update-env
             echo "✅ App reloaded via PM2"
@@ -99,7 +119,7 @@ jobs:
             echo "✅ App started fresh via PM2"
           fi
 
-      # ── Health check: wait for app to come back up ────────────────────────
+      # ── Health check ──────────────────────────────────────────────────────
       - name: Health check
         run: |
           echo "Waiting for app to start..."
@@ -120,7 +140,7 @@ jobs:
           pm2 logs dummy-app --lines 50
           exit 1
 
-      # ── Print deployment summary ──────────────────────────────────────────
+      # ── Deployment summary ────────────────────────────────────────────────
       - name: Deployment summary
         if: success()
         run: |
@@ -140,35 +160,31 @@ jobs:
         run: |
           echo "❌ Deployment failed — attempting rollback..."
           cd ${{ env.APP_DIR }}
-
-          # Go back one commit
           git reset --hard HEAD~1
-          npm ci --omit=dev
+          npm install --omit=dev
           pm2 reload dummy-app --update-env
-
           echo "⚠️  Rolled back to: $(git rev-parse --short HEAD)"
 
-  # ── Job 3: Notify team (optional) ─────────────────────────────────────────
+  # ── Job 3: Notify team ─────────────────────────────────────────────────────
   notify:
     name: Notify Team
     runs-on: ubuntu-latest
     needs: deploy
-    if: always()   # Always run, even if deploy failed
+    if: always()
 
     steps:
       - name: Notify success
         if: needs.deploy.result == 'success'
         run: |
-          echo "📢 Would send Slack/Teams notification: Deployment successful!"
-          # Uncomment and configure for real notifications:
+          echo "📢 Deployment successful!"
           # curl -X POST ${{ secrets.SLACK_WEBHOOK_URL }} \
           #   -H 'Content-type: application/json' \
-          #   --data '{"text":"✅ dummy-app deployed successfully by ${{ github.actor }}"}'
+          #   --data '{"text":"✅ dummy-app deployed by ${{ github.actor }}"}'
 
       - name: Notify failure
         if: needs.deploy.result == 'failure'
         run: |
-          echo "📢 Would send Slack/Teams notification: Deployment FAILED!"
+          echo "📢 Deployment FAILED!"
           # curl -X POST ${{ secrets.SLACK_WEBHOOK_URL }} \
           #   -H 'Content-type: application/json' \
-          #   --data '{"text":"❌ dummy-app deployment FAILED on commit ${{ github.sha }}"}'
+          #   --data '{"text":"❌ dummy-app deploy FAILED on ${{ github.sha }}"}'
